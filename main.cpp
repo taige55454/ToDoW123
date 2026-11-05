@@ -1,26 +1,22 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
 #include <mmsystem.h>
-#include <imm.h>
 #include <shellapi.h>
-#include <cstdarg>
 #include "gfx.h"
 #include "app.h"
 #include "resource.h"
-#include <cmath>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "winmm.lib")
-#pragma comment(lib, "imm32.lib")
 
-static const wchar_t* kClass = L"ToDoWell2Class";
+static const wchar_t* kClass = L"ToDoWellBallClass";
 static UINT_PTR kTimer = 1;
 static const UINT kTrayMsg = WM_APP + 1;
 static const UINT kTrayId = 1;
-static const UINT kMenuSettings = 1001;
+static const UINT kMenuShow = 1001;
 static const UINT kMenuExit = 1002;
 static MMRESULT g_mmTimer = 0;
 static HWND g_timerHwnd = nullptr;
@@ -33,9 +29,10 @@ static void AddTrayIcon(HWND hwnd) {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = kTrayMsg;
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));
-    wcscpy_s(nid.szTip, L"ToDoWell");
+    wcscpy_s(nid.szTip, L"EggDone 待办");
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
+
 static void RemoveTrayIcon(HWND hwnd) {
     NOTIFYICONDATAW nid = {};
     nid.cbSize = sizeof(nid);
@@ -47,54 +44,13 @@ static void RemoveTrayIcon(HWND hwnd) {
 static void CALLBACK mmTimerCb(UINT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR) {
     if (g_timerHwnd) PostMessageW(g_timerHwnd, WM_TIMER, kTimer, 0);
 }
+
 static LARGE_INTEGER g_qpfFreq = {};
 static LARGE_INTEGER g_qpfLast = {};
 
 static double nowSec() {
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
     return (double)c.QuadPart / (double)g_qpfFreq.QuadPart;
-}
-
-static void ApplyRoundCorners(HWND hwnd) {
-    bool ok = false;
-    if (HMODULE m = LoadLibraryW(L"dwmapi.dll")) {
-        typedef HRESULT(WINAPI* PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
-        if (auto fn = (PFN_DwmSetWindowAttribute)GetProcAddress(m, "DwmSetWindowAttribute")) {
-            int pref = 2;
-            ok = SUCCEEDED(fn(hwnd, 33, &pref, sizeof(pref)));
-        }
-        FreeLibrary(m);
-    }
-    if (!ok) {
-        RECT rc; GetWindowRect(hwnd, &rc);
-        int w = rc.right - rc.left, h = rc.bottom - rc.top;
-        HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 9, 9);
-        SetWindowRgn(hwnd, rgn, TRUE);
-        DeleteObject(rgn);
-    }
-}
-
-static void SnapToDefault(HWND hwnd, int pw, int ph) {
-    Config cfg = load_config();
-    RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    int x = wa.right - pw, y = wa.bottom - ph; // 0 = 右下角（默认）
-    switch (cfg.default_pos) {
-        case 1: x = wa.left; y = wa.top; break;          // 左上角
-        case 2: x = wa.left; y = wa.bottom - ph; break;  // 左下角
-        case 3: x = wa.right - pw; y = wa.top; break;    // 右上角
-        default: break;
-    }
-    SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-}
-
-static int CalcWindowW() {
-    const float wDip = 248.0f;
-    return (int)(wDip * g_gfx.dpiScale + 0.5f);
-}
-static int CalcWindowH() {
-    const float phi = 1.6180339887f;
-    const float hDip = 256.0f * phi;
-    return (int)(hDip * g_gfx.dpiScale + 0.5f);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -104,7 +60,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app = new App();
             g_app->create(hwnd);
             AddTrayIcon(hwnd);
-            ApplyRoundCorners(hwnd);
+
             QueryPerformanceFrequency(&g_qpfFreq);
             QueryPerformanceCounter(&g_qpfLast);
             timeBeginPeriod(1);
@@ -123,135 +79,64 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             double now = nowSec();
             float dt = (float)(now - ((double)g_qpfLast.QuadPart / (double)g_qpfFreq.QuadPart));
             g_qpfLast.QuadPart = (LONGLONG)(now * (double)g_qpfFreq.QuadPart);
-            if (dt > 0.1f) dt = 0.1f;
+            if (dt > 0.05f) dt = 0.05f;
             if (g_app) g_app->tick(dt);
             return 0;
         }
         case WM_SIZE: {
             g_gfx.resize();
-            if (g_app) g_app->onSize();
-            ApplyRoundCorners(hwnd);
             return 0;
-        }
-        case WM_MOVE: {
-            return 0;
-        }
-        case WM_CLOSE: {
-            // The titlebar X hides to the tray; only the tray menu's Exit
-            // actually closes the application.
-            if (g_app) { g_app->hideToTray(); return 0; }
-            break;
-        }
-        case WM_NCCALCSIZE: {
-            if (wp == TRUE) return 0;
-            break;
-        }
-        case WM_NCACTIVATE: return TRUE;
-        case WM_NCPAINT: return 0;
-        case WM_NCHITTEST: {
-            if (g_app) {
-                POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-                LRESULT ht = g_app->onNcHitTest(pt);
-                if (ht != HTCLIENT) return ht;
-                return HTCLIENT;
-            }
-            break;
         }
         case WM_MOUSEMOVE: {
             if (g_app) g_app->onMouseMove(g_app->toDip(GET_X_LPARAM(lp)), g_app->toDip(GET_Y_LPARAM(lp)));
+            return 0;
+        }
+        case WM_MOUSELEAVE: {
+            if (g_app) g_app->onMouseLeave();
             return 0;
         }
         case WM_LBUTTONDOWN: {
             if (g_app) g_app->onLButtonDown(g_app->toDip(GET_X_LPARAM(lp)), g_app->toDip(GET_Y_LPARAM(lp)));
             return 0;
         }
-        case WM_LBUTTONUP: {
-            if (g_app) g_app->onLButtonUp(g_app->toDip(GET_X_LPARAM(lp)), g_app->toDip(GET_Y_LPARAM(lp)));
-            return 0;
-        }
-        case WM_LBUTTONDBLCLK: {
-            if (g_app) g_app->onLButtonDblClk(g_app->toDip(GET_X_LPARAM(lp)), g_app->toDip(GET_Y_LPARAM(lp)));
+        case WM_RBUTTONUP: {
+            if (g_app) g_app->onRButtonUp(g_app->toDip(GET_X_LPARAM(lp)), g_app->toDip(GET_Y_LPARAM(lp)));
             return 0;
         }
         case WM_MOUSEWHEEL: {
             if (g_app) g_app->onWheel(GET_WHEEL_DELTA_WPARAM(wp));
             return 0;
         }
-        case WM_MOVING: if (g_app) { g_app->onMoving((RECT*)lp); return TRUE; } break;
-        case WM_SIZING: if (g_app) { g_app->onSizing((RECT*)lp); return TRUE; } break;
-        case WM_GETMINMAXINFO: if (g_app) { g_app->onMinMax((MINMAXINFO*)lp); return 0; } break;
-        case WM_CTLCOLOREDIT: {
-            HDC hdc = (HDC)wp;
-            SetBkColor(hdc, RGB(0xFF, 0xFF, 0xFF));
-            SetTextColor(hdc, RGB(0x1d, 0x1d, 0x1f));
-            static HBRUSH whiteBrush = CreateSolidBrush(RGB(0xFF, 0xFF, 0xFF));
-            return (LRESULT)whiteBrush;
+        case WM_CHAR: {
+            if (g_app) g_app->onChar((wchar_t)wp);
+            return 0;
         }
-        case WM_SETCURSOR: {
-            if (LOWORD(lp) == HTCLIENT) {
-                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-                return TRUE;
+        case WM_KEYDOWN: {
+            if (g_app) g_app->onKeyDown((int)wp);
+            return 0;
+        }
+        case WM_NCHITTEST: {
+            if (g_app) {
+                POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                return g_app->onNcHitTest(pt);
             }
             break;
         }
-        case WM_KEYDOWN: {
-        if (g_app && g_app->isEditing()) {
-            int vk = (int)wp;
-            if (vk == VK_RETURN || vk == VK_ESCAPE) {
-                g_app->onKeyDown(vk);
-                return 0;
-            }
-            // Backspace/delete handled by EDIT child (has focus)
-            return 0;
-        }
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    case WM_CHAR: {
-        if (g_app && !g_app->isEditing()) g_app->onChar((wchar_t)wp);
-        return 0;
-    }
-    case WM_INPUTLANGCHANGE:
-        // 切换输入法时重新识别（搜狗/其他第三方 -> 传统路径，微软拼音 -> 自绘路径）
-        if (g_app) g_app->refreshImeMode();
-        return TRUE;
-         
-    case WM_IME_SETCONTEXT:
-        return DefWindowProcW(hwnd, msg, wp, lp);
-        case WM_IME_STARTCOMPOSITION:
-            return DefWindowProcW(hwnd, msg, wp, lp);
-        case WM_IME_COMPOSITION:
-            // Composition is polled from the EDIT's IME context in tick() every frame.
-            // The main HWND's IME context is disassociated during editing (focus is on the EDIT child).
-            return DefWindowProcW(hwnd, msg, wp, lp);
-        case WM_IME_ENDCOMPOSITION:
-            if (g_app) g_app->onCompositionEnd();
-            return DefWindowProcW(hwnd, msg, wp, lp);
-        case WM_IME_CHAR:
-            if (g_app && g_app->isEditing()) {
-                g_app->onChar((wchar_t)wp);
-            }
-            return 0;
-        case WM_IME_NOTIFY:
-            return 0;
         case kTrayMsg: {
-            switch (LOWORD(lp)) {
-                case WM_RBUTTONUP: {
-                    SetForegroundWindow(hwnd);
-                    HMENU menu = CreatePopupMenu();
-                    AppendMenuW(menu, MF_STRING, kMenuSettings, L"\u8bbe\u7f6e");
-                    AppendMenuW(menu, MF_STRING, kMenuExit, L"\u9000\u51fa");
-                    POINT pt;
-                    GetCursorPos(&pt);
-                    UINT cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, nullptr);
-                    DestroyMenu(menu);
-                    PostMessageW(hwnd, WM_NULL, 0, 0);
-                    if (cmd == kMenuSettings && g_app) g_app->showFromTray(true);
-                    else if (cmd == kMenuExit && g_app) g_app->exitFromTray();
-                    return 0;
-                }
-                case WM_LBUTTONUP:
-                    if (g_app) g_app->showFromTray(false);
-                    return 0;
+            if (LOWORD(lp) == WM_RBUTTONUP) {
+                SetForegroundWindow(hwnd);
+                HMENU menu = CreatePopupMenu();
+                AppendMenuW(menu, MF_STRING, kMenuShow, L"🖥️ 显示主面板");
+                AppendMenuW(menu, MF_STRING, kMenuExit, L"✖ 彻底退出");
+                POINT pt; GetCursorPos(&pt);
+                UINT cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, nullptr);
+                DestroyMenu(menu);
+                if (cmd == kMenuShow && g_app) g_app->showFromTray(false);
+                else if (cmd == kMenuExit && g_app) g_app->exitFromTray();
+                return 0;
+            } else if (LOWORD(lp) == WM_LBUTTONUP) {
+                if (g_app) g_app->showFromTray(false);
+                return 0;
             }
             return 0;
         }
@@ -268,8 +153,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     SetProcessDPIAware();
+
+    // 进程单例检测
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"EggDone_Cpp_Single_Instance_Mutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(nullptr, L"程序已在运行！请查看屏幕右侧或系统托盘。", L"提示", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
+
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
@@ -279,34 +172,39 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     wc.hbrBackground = nullptr;
     wc.lpszClassName = kClass;
     wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP));
-    wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
 
-    {
-        HDC hdc = GetDC(nullptr);
-        int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
-        ReleaseDC(nullptr, hdc);
-        if (dpi <= 0) dpi = 96;
-        g_gfx.dpiScale = dpi / 96.0f;
-    }
+    HDC hdc = GetDC(nullptr);
+    int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+    ReleaseDC(nullptr, hdc);
+    g_gfx.dpiScale = (dpi <= 0 ? 96 : dpi) / 96.0f;
 
-    int pw = CalcWindowW(), ph = CalcWindowH();
+    RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int initPx = (int)(60.0f * g_gfx.dpiScale + 0.5f);
+    int posX = wa.right - initPx - (int)(20.0f * g_gfx.dpiScale);
+    int posY = wa.top + (int)(60.0f * g_gfx.dpiScale);
+
+    // 悬浮顶层异型窗口：POPUP + TOPMOST + TOOLWINDOW（无任务栏图标、无系统标题栏）
     HWND hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         kClass, L"ToDoWell",
-        WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN | WS_VISIBLE,
-        0, 0, pw, ph,
+        WS_POPUP | WS_VISIBLE,
+        posX, posY, initPx, initPx,
         nullptr, nullptr, hInst, nullptr);
+
     if (!hwnd) return 0;
 
-    SnapToDefault(hwnd, pw, ph);
-    ShowWindow(hwnd, nShow);
+    ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+
+    if (hMutex) {
+        CloseHandle(hMutex);
     }
     return (int)msg.wParam;
 }
