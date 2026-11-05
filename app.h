@@ -5,6 +5,28 @@
 #include <string>
 #include "storage.h"
 
+// =====================================================
+// 新增：AppC 常量命名空间
+// =====================================================
+namespace AppC {
+    constexpr float MIN_W = 260.0f;
+    constexpr float MIN_H = 340.0f;
+    constexpr float TITLE_H = 32.0f;
+    constexpr float BOT_H = 40.0f;
+    constexpr float RESIZE_M = 8.0f;
+    constexpr float SNAP_GAP = 10.0f;
+    constexpr float SCROLL_STEP = 60.0f;
+    constexpr float CONTENT_TOP = 12.0f;
+    constexpr float CONTENT_PAD = 12.0f;
+    constexpr float CARD_TOP = 8.0f;
+    constexpr float CARD_INNER = 12.0f;
+    constexpr float CARD_GAP = 12.0f;
+    constexpr float BADGE_MIN_W = 36.0f;
+    constexpr float BADGE_H = 18.0f;
+    constexpr float CIRCLE_R = 8.0f;
+    constexpr float ROW_H = 24.0f;
+}
+
 struct Hit {
     D2D1_RECT_F rc;
     enum Type { H_PROJ_NAME, H_PROJ_DEL, H_TODO_CIRCLE, H_TODO_TEXT, H_NEWTODO, H_PROJ_CARD } type;
@@ -47,9 +69,18 @@ public:
     void hideToTray();
     void exitFromTray();
 
+    // =====================================================
+    // 将这些方法改为 public，供 main.cpp 调用
+    // =====================================================
+    float toDip(int px) const;
+    int toPx(float dip) const;
+    void refreshImeMode();
+    void hideImeWindows();
+
 private:
     HWND m_hwnd = nullptr;
     HWND m_edit = nullptr;
+    WNDPROC m_editOldProc = nullptr; // ← 新增：保存原始窗口过程
     int m_editPosX = -1, m_editPosY = -1, m_editPosW = -1, m_editPosH = -1;
     float m_w = 0, m_h = 0;
     std::vector<Project> m_projects;
@@ -105,7 +136,7 @@ private:
     bool m_startupRaised = false;
 
     // =====================================================
-    // 新增：专注森林相关成员变量
+    // 专注森林相关成员变量
     // =====================================================
     bool m_forestRunning = false;
     float m_forestRemainSecs = 0.0f;
@@ -115,8 +146,6 @@ private:
     bool m_hoverForestBtn = false;
     float m_forestBtnT = 0.0f;
 
-    float toDip(int px) const;
-    int toPx(float dip) const;
     void approach(float& cur, float target, float dt, float speed);
     void requestRedraw();
     void clampScroll();
@@ -126,9 +155,7 @@ private:
     float cardHeaderH() const;
     void applyCardTextSize();
     void ensureEditCreated();
-    void hideImeWindows();
     bool detectLegacyIme();
-    void refreshImeMode();
     std::wstring editGetText();
     void editSetText(const std::wstring& s);
     void beginEdit(EditMode mode, int pi, int ti, const std::wstring& initial);
@@ -139,7 +166,6 @@ private:
     void positionEdit();
     int editCaretPos() const;
     void setEditCaretFromPoint(float x, float y);
-    void drawEditCaret(class Gfx& g, int fid, const std::wstring& text, float left, float top, float width, float height);
     void pollIme();
     void cancelEdit();
     void commitEdit();
@@ -152,9 +178,6 @@ private:
     void openAbout();
     void closeAbout();
     void openHistory();
-    // =====================================================
-    // 新增：专注森林方法
-    // =====================================================
     void openForest();
     
     float todoRowH(const std::wstring& text, float maxW);
