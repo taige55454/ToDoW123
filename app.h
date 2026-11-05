@@ -4,9 +4,10 @@
 #include <vector>
 #include <string>
 #include "storage.h"
+#include "gfx.h"
 
 // =====================================================
-// 新增：AppC 常量命名空间
+// 布局常量
 // =====================================================
 namespace AppC {
     constexpr float MIN_W = 260.0f;
@@ -27,9 +28,21 @@ namespace AppC {
     constexpr float ROW_H = 24.0f;
 }
 
+// =====================================================
+// 点击命中枚举（暴露到全局，避免 app.cpp 报 C2065 和 C2051）
+// =====================================================
+enum HitType {
+    H_PROJ_NAME,
+    H_PROJ_DEL,
+    H_TODO_CIRCLE,
+    H_TODO_TEXT,
+    H_NEWTODO,
+    H_PROJ_CARD
+};
+
 struct Hit {
     D2D1_RECT_F rc;
-    enum Type { H_PROJ_NAME, H_PROJ_DEL, H_TODO_CIRCLE, H_TODO_TEXT, H_NEWTODO, H_PROJ_CARD } type;
+    HitType type;
     int pi, ti;
 };
 
@@ -69,9 +82,7 @@ public:
     void hideToTray();
     void exitFromTray();
 
-    // =====================================================
-    // 将这些方法改为 public，供 main.cpp 调用
-    // =====================================================
+    // 供 main.cpp 调用的公共方法
     float toDip(int px) const;
     int toPx(float dip) const;
     void refreshImeMode();
@@ -80,7 +91,7 @@ public:
 private:
     HWND m_hwnd = nullptr;
     HWND m_edit = nullptr;
-    WNDPROC m_editOldProc = nullptr; // ← 新增：保存原始窗口过程
+    WNDPROC m_editOldProc = nullptr;
     int m_editPosX = -1, m_editPosY = -1, m_editPosW = -1, m_editPosH = -1;
     float m_w = 0, m_h = 0;
     std::vector<Project> m_projects;
@@ -135,9 +146,7 @@ private:
     float m_startupT = 0;
     bool m_startupRaised = false;
 
-    // =====================================================
     // 专注森林相关成员变量
-    // =====================================================
     bool m_forestRunning = false;
     float m_forestRemainSecs = 0.0f;
     float m_forestTotalSecs = 0.0f;
@@ -166,6 +175,7 @@ private:
     void positionEdit();
     int editCaretPos() const;
     void setEditCaretFromPoint(float x, float y);
+    void drawEditCaret(class Gfx& g, FontId fid, const std::wstring& text, float left, float top, float width, float height);
     void pollIme();
     void cancelEdit();
     void commitEdit();
