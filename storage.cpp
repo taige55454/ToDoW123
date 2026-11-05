@@ -7,6 +7,8 @@
 #include <cwchar>
 #include <algorithm>
 #include <ctime>
+#include <objbase.h> 
+#pragma comment(lib, "ole32.lib")
 
 std::wstring utf8_to_w(const std::string& s) {
     if (s.empty()) return L"";
