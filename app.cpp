@@ -1,4 +1,4 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
@@ -10,6 +10,7 @@
 #include "app.h"
 #include "resource.h"
 #include <cmath>
+#include <algorithm>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -22,10 +23,115 @@ static HFONT g_fontTodo = nullptr;
 static HFONT g_fontProj = nullptr;
 static HBRUSH g_whiteBrush = nullptr;
 static const float kCardTextScales[] = {0.90f, 1.00f, 1.15f, 1.30f};
-// 版权署名：公开版为 anqilike；编译内部版时把这里改为 5014 即可全局生效。
 static const wchar_t* kCopyright = L"\u7248\u6743\u6240\u6709@\u5929\u624d\u7684anqilike";
 
 App* g_app = nullptr;
+
+// ============================================================
+// 快捷输入解析：识别 ! / 重要 / 日期词 / 时间，返回标签前缀
+// ============================================================
+static std::wstring ParseQuickLabels(const std::wstring& raw, std::wstring& outTitle) {
+    std::wstring text = raw;
+    std::wstring labels;
+
+    // 1. 优先级：! 或 重要
+    bool important = false;
+    {
+        size_t p = text.find(L"!");
+        if (p == std::wstring::npos) p = text.find(L"！");
+        if (p != std::wstring::npos) {
+            important = true;
+            text.erase(p, 1);
+        }
+    }
+    if (!important) {
+        size_t p = text.find(L"\u91cd\u8981"); // 重要
+        if (p != std::wstring::npos) {
+            important = true;
+            text.erase(p, 2);
+        }
+    }
+    if (important) labels += L"[⭐]";
+
+    // 2. 日期词：今天/明天/后天/大后天/下周X
+    const struct { const wchar_t* kw; const wchar_t* tag; } dateKws[] = {
+        {L"\u5927\u540e\u5929", L"[大后天]"},
+        {L"\u540e\u5929",       L"[后天]"},
+        {L"\u660e\u5929",       L"[明天]"},
+        {L"\u4eca\u5929",       L"[今天]"},
+    };
+    for (auto& dk : dateKws) {
+        size_t p = text.find(dk.kw);
+        if (p != std::wstring::npos) {
+            labels += dk.tag;
+            text.erase(p, wcslen(dk.kw));
+            break;
+        }
+    }
+
+    // 3. 时间：HH:MM 或 HH：MM
+    {
+        // 先处理全角冒号
+        std::wstring tmp = text;
+        for (auto& c : tmp) if (c == L'\uff1a') c = L':';
+
+        bool found = false;
+        for (size_t i = 0; i + 4 < tmp.size() + 1; ++i) {
+            if (i + 4 > tmp.size()) break;
+            wchar_t c = tmp[i];
+            if (c >= L'0' && c <= L'2') {
+                if (tmp[i+1] >= L'0' && tmp[i+1] <= L'9' && tmp[i+2] == L':') {
+                    if (tmp[i+3] >= L'0' && tmp[i+3] <= L'5' && tmp[i+4] >= L'0' && tmp[i+4] <= L'9') {
+                        wchar_t tbuf[8] = {};
+                        wcsncpy_s(tbuf, tmp.c_str() + i, 5);
+                        labels += L"[🕒";
+                        labels += tbuf;
+                        labels += L"]";
+                        // 从原始 text 删除（找原始对应位置）
+                        size_t op = text.find(raw.substr(i, 5));
+                        // 简单处理：直接在 text 里删对应5字符
+                        if (i + 4 < text.size()) {
+                            text.erase(i, 5);
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        (void)found;
+    }
+
+    // 4. 周期词
+    const struct { const wchar_t* kw; const wchar_t* tag; } repeatKws[] = {
+        {L"\u6bcf\u5929",   L"[🔁每天]"},
+        {L"\u5de5\u4f5c\u65e5", L"[🔁工作日]"},
+        {L"\u6bcf\u5468",   L"[🔁每周]"},
+        {L"\u6bcf\u6708",   L"[🔁每月]"},
+    };
+    for (auto& rk : repeatKws) {
+        size_t p = text.find(rk.kw);
+        if (p != std::wstring::npos) {
+            labels += rk.tag;
+            text.erase(p, wcslen(rk.kw));
+            break;
+        }
+    }
+
+    // 清理多余空格
+    while (!text.empty() && text.front() == L' ') text.erase(0, 1);
+    while (!text.empty() && text.back() == L' ') text.pop_back();
+    // 合并连续空格
+    std::wstring clean;
+    bool lastSpace = false;
+    for (wchar_t c : text) {
+        if (c == L' ') { if (!lastSpace) clean += c; lastSpace = true; }
+        else { clean += c; lastSpace = false; }
+    }
+
+    outTitle = clean.empty() ? raw : clean;
+    return labels;
+}
 
 float App::toDip(int px) const { return g_gfx.dpiScale > 0 ? px / g_gfx.dpiScale : (float)px; }
 int App::toPx(float dip) const { return (int)(dip * g_gfx.dpiScale + 0.5f); }
@@ -70,7 +176,6 @@ void App::showFromTray(bool openSettingsPanel) {
 }
 void App::hideToTray() {
     if (m_closing || m_hidingToTray) return;
-    // Commit/cancel the current edit so typed text is never silently lost.
     if (m_editMode != ED_NONE) onEditKillFocus();
     saveAll();
     m_hidingToTray = true;
@@ -78,25 +183,17 @@ void App::hideToTray() {
     requestRedraw();
 }
 void App::bringToFront() {
-    // Windows 10 can leave a WS_EX_TOOLWINDOW (no taskbar button) below the
-    // desktop icon layer (SHELLDLL_DefView) when the window is created while
-    // Explorer is still building the desktop, e.g. at auto-start. Moving to
-    // TOPMOST and immediately back to NOTOPMOST lifts it above the icon layer
-    // without keeping it always-on-top.
     SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     SetWindowPos(m_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
-void App::exitFromTray() {
-    requestClose();
-}
+void App::exitFromTray() { requestClose(); }
+
 bool App::animating() const {
     if (m_closing) return true;
     if (m_hidingToTray) return true;
     if (m_draggingCard) return true;
     if (m_cardDropAnimating) return true;
     if (m_snapping) return true;
-    // Keep repainting while the overlay shade fades in OR out, so the main
-    // page never gets stuck dimmed after closing settings/about.
     if (m_overlayAlpha > 0.01f) return true;
     if (m_aboutAlpha > 0.01f) return true;
     if ((m_addSpin > 0.001f && m_addSpin < 1.0f) ||
@@ -104,8 +201,11 @@ bool App::animating() const {
         (m_projDelSpin > 0.001f && m_projDelSpin < 1.0f)) return true;
     if (m_circT > 0.001f && m_circT < 1.0f) return true;
     if (!m_fades.empty()) return true;
+    // 专注森林计时器运行时持续刷新
+    if (m_forestRunning) return true;
     return false;
 }
+
 static HFONT makeHFont(int pt, bool bold) {
     HDC hdc = GetDC(nullptr);
     int h = -MulDiv(pt, GetDeviceCaps(hdc, LOGPIXELSY), 72);
@@ -114,15 +214,15 @@ static HFONT makeHFont(int pt, bool bold) {
                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
 }
+
 float App::cardHeaderH() const {
-    // Keep the original 18-DIP header at the default size; only grow it when
-    // the project title itself needs more vertical room.
     static const float headerH[] = {18.0f, 18.0f, 21.0f, 25.0f};
     int i = m_cfg.card_text_size;
     if (i < 0) i = 0;
     if (i > 3) i = 3;
     return headerH[i];
 }
+
 void App::applyCardTextSize() {
     int i = m_cfg.card_text_size;
     if (i < 0) i = 0;
@@ -150,6 +250,7 @@ void App::applyCardTextSize() {
     if (m_editMode != ED_NONE) positionEdit();
     requestRedraw();
 }
+
 void App::create(HWND hwnd) {
     g_app = this;
     m_hwnd = hwnd;
@@ -164,15 +265,23 @@ void App::create(HWND hwnd) {
     m_cfg.auto_start = is_auto_start();
     m_w = g_gfx.clientW();
     m_h = g_gfx.clientH();
-    refreshImeMode(); // 打开时立即识别当前输入法（搜狗走传统路径，微软拼音走自绘路径）
+    // 初始化专注森林状态
+    m_forestRunning = false;
+    m_forestRemainSecs = (float)(m_cfg.focus_minutes * 60);
+    m_forestTotalSecs  = m_forestRemainSecs;
+    m_forestElapsedSecs = 0.0f;
+    m_forestDone = false;
+    refreshImeMode();
     applyCardTextSize();
 }
+
 void App::destroy() {
     saveAll();
     if (g_whiteBrush) { DeleteObject(g_whiteBrush); g_whiteBrush = nullptr; }
     if (g_fontTodo) { DeleteObject(g_fontTodo); g_fontTodo = nullptr; }
     if (g_fontProj) { DeleteObject(g_fontProj); g_fontProj = nullptr; }
 }
+
 void App::ensureEditCreated() {
     if (m_edit) return;
     m_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL,
@@ -181,16 +290,11 @@ void App::ensureEditCreated() {
         g_editOldProc = (WNDPROC)SetWindowLongPtrW(m_edit, GWLP_WNDPROC, (LONG_PTR)EditSubproc);
         m_editOldProc = g_editOldProc;
         SendMessageW(m_edit, WM_SETFONT, (WPARAM)g_fontTodo, TRUE);
-        // Clip the EDIT's own drawing to 1 pixel: the IME/EDIT may paint the
-        // composition into its DC (bypassing WM_PAINT), which would overlap
-        // the D2D text. The window rect stays full-size for TSF geometry.
         HRGN rgn = CreateRectRgn(0, 0, 1, 1);
         SetWindowRgn(m_edit, rgn, TRUE);
     }
 }
-// The IME draws the in-progress pinyin in its own floating window
-// ("MSCTFIME Composition"). The app renders the composition itself via D2D,
-// so this system window is hidden to keep the input visually integrated.
+
 static void HideImeCompositionWindowsInternal() {
     EnumWindows([](HWND h, LPARAM) -> BOOL {
         wchar_t cls[64];
@@ -202,42 +306,30 @@ static void HideImeCompositionWindowsInternal() {
         return TRUE;
     }, 0);
 }
-// Hide the IME's own composition/candidate windows for modern TSF IMEs
-// (Microsoft Pinyin), which expose candidate data through the IMM bridge so
-// the app can render its own integrated UI. Legacy IMEs (e.g. Sogou on
-// Windows 7) keep their own windows visible.
+
 void App::hideImeWindows() {
     if (m_imeLegacy) return;
-    // Re-check the active IME before hiding anything: legacy IMEs (Sogou,
-    // other third-party IMEs) must keep their own windows, and hiding them
-    // at composition start is what made the candidate box disappear.
-    if (detectLegacyIme()) {
-        m_imeLegacy = true;
-        return;
-    }
+    if (detectLegacyIme()) { m_imeLegacy = true; return; }
     HideImeCompositionWindowsInternal();
 }
+
 bool App::detectLegacyIme() {
     HKL hkl = GetKeyboardLayout(0);
     wchar_t desc[128] = {};
     if (ImmGetDescriptionW(hkl, desc, 128) > 0) {
         std::wstring s(desc);
-        // Microsoft built-in Pinyin exposes candidates through the IMM bridge
-        // and works with the app-rendered candidate popup.
         if (s.find(L"Microsoft") != std::wstring::npos) return false;
-        if (s.find(L"\u5fae\u8f6f\u62fc\u97f3") != std::wstring::npos) return false; // 微软拼音
-        // Sogou and other third-party IMEs manage their own candidate UI and
-        // often do not expose candidate data -> keep their windows visible.
-        if (s.find(L"\u641c\u72d7") != std::wstring::npos ||   // 搜狗
+        if (s.find(L"\u5fae\u8f6f\u62fc\u97f3") != std::wstring::npos) return false;
+        if (s.find(L"\u641c\u72d7") != std::wstring::npos ||
             s.find(L"Sogou") != std::wstring::npos ||
             s.find(L"sogou") != std::wstring::npos) return true;
-        return true; // any other non-Microsoft IME -> legacy path
+        return true;
     }
     return false;
 }
-void App::refreshImeMode() {
-    m_imeLegacy = detectLegacyIme();
-}
+
+void App::refreshImeMode() { m_imeLegacy = detectLegacyIme(); }
+
 LRESULT CALLBACK EditSubproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_KEYDOWN) {
         if (wp == VK_RETURN) { if (g_app) g_app->onEditReturn(); return 0; }
@@ -256,7 +348,6 @@ LRESULT CALLBACK EditSubproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_app) g_app->onEditKillFocus();
     } else if (msg == WM_SETFOCUS) {
         LRESULT res = CallWindowProcW(g_editOldProc, h, msg, wp, lp);
-        // The EDIT paints nothing; D2D draws the visible caret.
         HideCaret(h);
         return res;
     } else if (msg == WM_PAINT) {
@@ -267,8 +358,6 @@ LRESULT CALLBACK EditSubproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     } else if (msg == WM_PRINTCLIENT) {
         return 0;
     } else if (msg == WM_IME_SETCONTEXT) {
-        // Hide the IME's own composition/guideline windows; the app renders
-        // its own input UI. Candidate data is kept so the built-in popup works.
         LPARAM flags = lp & ~(ISC_SHOWUICOMPOSITIONWINDOW | ISC_SHOWUIGUIDELINE);
         LRESULT res = CallWindowProcW(g_editOldProc, h, msg, wp, flags);
         if (g_app) g_app->hideImeWindows();
@@ -316,6 +405,7 @@ LRESULT CALLBACK EditSubproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return CallWindowProcW(g_editOldProc, h, msg, wp, lp);
 }
+
 std::wstring App::editGetText() {
     if (!m_edit) return L"";
     int n = GetWindowTextLengthW(m_edit);
@@ -323,12 +413,14 @@ std::wstring App::editGetText() {
     if (n > 0) GetWindowTextW(m_edit, &s[0], n + 1);
     return s;
 }
+
 void App::editSetText(const std::wstring& s) {
     if (!m_edit) return;
     SetWindowTextW(m_edit, s.c_str());
     int len = (int)s.size();
-    SendMessageW(m_edit, EM_SETSEL, len, len); // caret at end, no selection
+    SendMessageW(m_edit, EM_SETSEL, len, len);
 }
+
 void App::onEditChanged(bool userKey) {
     if (m_editMode == ED_NONE || !m_edit || !m_compositionText.empty()) return;
     std::wstring cur = editGetText();
@@ -350,6 +442,7 @@ void App::onEditChanged(bool userKey) {
         requestRedraw();
     }
 }
+
 void App::beginEdit(EditMode mode, int pi, int ti, const std::wstring& initial) {
     m_editMode = mode; m_editPi = pi; m_editTi = ti;
     m_editText = initial;
@@ -377,15 +470,15 @@ void App::beginEdit(EditMode mode, int pi, int ti, const std::wstring& initial) 
     if (m_edit) { SetFocus(m_edit); }
     requestRedraw();
 }
+
 void App::startEdit(EditMode mode, int pi, int ti, const std::wstring& initial) {
-    // If a different field is being edited, commit it first so typed changes
-    // are never silently discarded when the user clicks another editable row.
     if (m_editMode != ED_NONE && m_editMode != ED_PREF_PREFIX &&
         !(m_editMode == mode && m_editPi == pi && m_editTi == ti)) {
         commitEdit();
     }
     beginEdit(mode, pi, ti, initial);
 }
+
 void App::endEdit(bool applyFocus) {
     m_reentering = true;
     m_editMode = ED_NONE; m_editPi = -1; m_editTi = -1;
@@ -402,15 +495,17 @@ void App::endEdit(bool applyFocus) {
     }
     requestRedraw();
 }
+
 float App::editUnderlineDip() const {
     if (m_editMode == ED_PREF_PREFIX || m_editRectDip.right <= m_editRectDip.left)
         return -1.0f;
     switch (m_editMode) {
-        case ED_EDIT_PROJECT: return m_editRectDip.bottom - 3.0f; // BADGE_H row
-        case ED_ADD_PROJECT:  return m_editRectDip.bottom;        // 30px new-project line
-        default:              return m_editRectDip.bottom - 2.0f; // todo rows
+        case ED_EDIT_PROJECT: return m_editRectDip.bottom - 3.0f;
+        case ED_ADD_PROJECT:  return m_editRectDip.bottom;
+        default:              return m_editRectDip.bottom - 2.0f;
     }
 }
+
 int App::editTextHeightPx() const {
     if (!m_edit) return toPx(AppC::ROW_H);
     HFONT f = (m_editMode == ED_EDIT_PROJECT || m_editMode == ED_ADD_PROJECT)
@@ -425,11 +520,10 @@ int App::editTextHeightPx() const {
     ReleaseDC(m_edit, hdc);
     return h;
 }
+
 void App::positionEdit() {
     if (!m_edit || m_editMode == ED_NONE) return;
     if (m_editRectDip.left == 0 && m_editRectDip.right == 0) return;
-    // Keep the hidden EDIT's text bottom on the visible underline so the
-    // TSF caret/IME geometry uses the same line as the UI.
     float editW = std::max(40.0f, m_editRectDip.right - m_editRectDip.left);
     float editTop;
     float editH;
@@ -443,18 +537,14 @@ void App::positionEdit() {
     }
     int ex = toPx(m_editRectDip.left), ey = toPx(editTop);
     int ew = toPx(editW), eh = toPx(editH);
-    // Avoid repositioning every tick (1ms timer): a SetWindowPos storm disturbs
-    // the IME's caret-geometry queries. Only move when something changed.
     if (ex != m_editPosX || ey != m_editPosY || ew != m_editPosW || eh != m_editPosH) {
         SetWindowPos(m_edit, nullptr, ex, ey, ew, eh, SWP_NOZORDER | SWP_NOACTIVATE);
         m_editPosX = ex; m_editPosY = ey; m_editPosW = ew; m_editPosH = eh;
     }
     ShowWindow(m_edit, SW_SHOWNOACTIVATE);
-    HideCaret(m_edit); // D2D draws the visible caret
+    HideCaret(m_edit);
 }
-// Returns caret geometry relative to a text layout that matches how the text is
-// drawn (same width/height, vertically centered): x from the layout's left edge
-// and the top/height of the caret's line.
+
 static bool editCaretGeometry(const std::wstring& text, int pos, float maxW, float maxH, FontId fid,
                               float& relX, float& relTop, float& relH) {
     if (text.empty() || maxW <= 0 || maxH <= 0) return false;
@@ -472,14 +562,11 @@ static bool editCaretGeometry(const std::wstring& text, int pos, float maxW, flo
               SUCCEEDED(lay->HitTestTextPosition((UINT32)std::min(pos, (int)text.size()),
                                                  FALSE, &hx, &hy, &htm)) &&
               htm.height > 0;
-    if (ok) {
-        relX = hx; relTop = htm.top; relH = htm.height;
-    }
+    if (ok) { relX = hx; relTop = htm.top; relH = htm.height; }
     lay->Release();
     return ok;
 }
-// Converts a point inside the text layout (relative to its top-left) to a
-// character index, matching how DirectWrite places the caret on click.
+
 static int editIndexFromPoint(const std::wstring& text, float x, float y, float maxW, float maxH, FontId fid) {
     if (text.empty() || maxW <= 0 || maxH <= 0) return 0;
     IDWriteTextFormat* fmt = g_gfx.font(fid);
@@ -500,15 +587,17 @@ static int editIndexFromPoint(const std::wstring& text, float x, float y, float 
     if (pos > (int)text.size()) pos = (int)text.size();
     return pos;
 }
+
 int App::editCaretPos() const {
     if (!m_edit) return (int)m_editText.size();
     DWORD selStart = 0, selEnd = 0;
     SendMessageW(m_edit, EM_GETSEL, (WPARAM)&selStart, (LPARAM)&selEnd);
     return (int)selEnd;
 }
+
 void App::setEditCaretFromPoint(float x, float y) {
     if (!m_edit || m_editMode == ED_NONE) return;
-    if (!m_compositionText.empty()) return; // IME owns the caret while composing
+    if (!m_compositionText.empty()) return;
     FontId fid = (m_editMode == ED_EDIT_PROJECT || m_editMode == ED_ADD_PROJECT) ? F_PROJ_NAME : F_TODO;
     float maxW = m_editRectDip.right - m_editRectDip.left;
     float maxH = m_editRectDip.bottom - m_editRectDip.top;
@@ -519,18 +608,16 @@ void App::setEditCaretFromPoint(float x, float y) {
     m_cursorBlink = 0;
     requestRedraw();
 }
+
 void App::drawEditCaret(Gfx& g, FontId fid, const std::wstring& text,
                         float left, float top, float width, float height) {
-    if (((int)(m_cursorBlink * 2) % 2) != 0) return; // blink off
-    float cx = left + g.measureTextW(text, fid) + 1;   // fallback: end of text
+    if (((int)(m_cursorBlink * 2) % 2) != 0) return;
+    float cx = left + g.measureTextW(text, fid) + 1;
     float cy = top + 2;
     float ch = height - 4;
     int caretPos = (int)text.size();
     if (m_compositionText.empty()) {
         caretPos = editCaretPos();
-        // Some IMEs momentarily reset the EDIT selection to 0 while committing
-        // text. Keep the last known position for that transient frame instead
-        // of drawing the caret at the start of the line.
         if (caretPos == 0 && !text.empty() && m_lastCaretPos > 0)
             caretPos = m_lastCaretPos;
     }
@@ -542,10 +629,7 @@ void App::drawEditCaret(Gfx& g, FontId fid, const std::wstring& text,
     }
     g.drawLine(cx, cy + 1, cx, cy + ch - 1, C::ACCENT, 1.5f);
 }
-// The system IME (Microsoft Pinyin compatibility mode) draws its composition
-// and candidate list in its own floating window. That window is hidden, so
-// this polls the IME state and the app renders the pinyin and candidates
-// itself (fully integrated with the UI).
+
 void App::pollIme() {
     if (!m_edit || m_editMode == ED_NONE) return;
     HIMC himc = ImmGetContext(m_edit);
@@ -560,7 +644,7 @@ void App::pollIme() {
     }
     bool textChanged = (comp != m_compositionText);
     if (!comp.empty() && m_compositionText.empty()) {
-        m_imeLegacy = detectLegacyIme(); // detect per composition session
+        m_imeLegacy = detectLegacyIme();
     }
     m_compositionText = comp;
     if (textChanged) m_cursorBlink = 0;
@@ -584,9 +668,6 @@ void App::pollIme() {
             }
         }
     }
-    // Legacy path: IMEs like Sogou manage their own composition/candidate
-    // windows and do not expose candidate data. Position their windows at the
-    // caret with the classic Imm* calls (screen coordinates), which they honor.
     if (m_imeLegacy && !comp.empty()) {
         FontId fid = F_TODO;
         if (m_editMode == ED_EDIT_PROJECT || m_editMode == ED_ADD_PROJECT) fid = F_PROJ_NAME;
@@ -597,9 +678,6 @@ void App::pollIme() {
         if (m_editMode != ED_PREF_PREFIX) py += AppC::TITLE_H - m_scroll;
         POINT ptComp = { toPx(px), toPx(py) };
         POINT ptCand = { toPx(px), toPx(py + 4.0f) };
-        // Legacy IMM IMEs (Sogou on Win7) expect CLIENT coordinates relative
-        // to the application window; screen coordinates made the candidate
-        // window clamp to the window edge or disappear entirely.
         COMPOSITIONFORM cf = {};
         cf.dwStyle = CFS_POINT;
         cf.ptCurrentPos = ptComp;
@@ -614,19 +692,18 @@ void App::pollIme() {
     bool candChanged = (cands != m_cands || sel != m_candSel);
     m_cands = std::move(cands);
     m_candSel = sel;
-
     ImmReleaseContext(m_edit, himc);
     if (textChanged || candChanged) requestRedraw();
 }
+
 void App::cancelEdit() {
     if (m_addingProject) { m_addingProject = false; }
     endEdit(false);
 }
+
 void App::onEditKillFocus() {
     if (m_editMode == ED_NONE || m_reentering) return;
-    if (m_editMode == ED_PREF_PREFIX) return; // handled by the settings click logic
-    // If the user typed something and clicked away without Enter, auto-commit
-    // the edit (like pressing Enter); an empty edit is simply cancelled.
+    if (m_editMode == ED_PREF_PREFIX) return;
     std::wstring t = editGetText();
     size_t a = t.find_first_not_of(L" \t\r\n");
     size_t b = t.find_last_not_of(L" \t\r\n");
@@ -637,11 +714,14 @@ void App::onEditKillFocus() {
         endEdit(false);
     }
 }
+
 void App::onEditReturn() { commitEdit(); }
+
 void App::onEditEscape() {
     if (m_editMode == ED_PREF_PREFIX) { endEdit(false); closeSettings(); return; }
     if (m_editMode != ED_NONE) cancelEdit();
 }
+
 void App::commitEdit() {
     std::wstring t = editGetText();
     size_t a = t.find_first_not_of(L" \t\r\n");
@@ -666,7 +746,17 @@ void App::commitEdit() {
         case ED_NEW_TODO: {
             int pi = m_editPi;
             if (!trimmed.empty() && pi >= 0 && pi < (int)m_projects.size()) {
-                m_projects[pi].todos.push_back({trimmed, false, now_iso()});
+                // =============================================
+                // 新增：解析快捷标签，把标签前缀追加到文字前面
+                // =============================================
+                std::wstring title;
+                std::wstring labels = ParseQuickLabels(trimmed, title);
+                std::wstring finalText = labels.empty() ? title : (labels + L" " + title);
+                TodoItem item;
+                item.text = finalText;
+                item.done = false;
+                item.created = now_iso();
+                m_projects[pi].todos.push_back(item);
                 saveAll();
                 rebuildHits();
                 m_cursorBlink = 0;
@@ -697,6 +787,7 @@ void App::commitEdit() {
         default: break;
     }
 }
+
 void App::addProjectCommit(const std::wstring& name) {
     m_projects.push_back({name, {}});
     m_addingProject = false;
@@ -705,9 +796,9 @@ void App::addProjectCommit(const std::wstring& name) {
     endEdit(false);
     focusNewTodo(ni);
 }
+
 void App::focusNewTodo(int pi) {
     beginEdit(ED_NEW_TODO, pi, -1, L"");
-    // 只滚动到新任务行刚好可见，而不是跳到整页最底端。
     float viewH = m_h - AppC::TITLE_H - AppC::BOT_H;
     float target = m_scroll;
     for (auto& hit : m_hits) {
@@ -722,28 +813,34 @@ void App::focusNewTodo(int pi) {
     m_scrollTarget = target;
     clampScroll();
 }
+
 void App::completeTodo(int pi, int ti) {
     m_fades.push_back({pi, ti, 1.0f, 0.0f});
     requestRedraw();
 }
+
 void App::delProject(int pi) {
     if (pi < 0 || pi >= (int)m_projects.size()) return;
     m_projects.erase(m_projects.begin() + pi);
     saveAll();
     requestRedraw();
 }
+
 void App::openSettings() {
     m_settings = true;
     m_setScroll = 0; m_setScrollTarget = 0;
     requestRedraw();
 }
+
 void App::closeSettings() {
     m_settings = false;
     if (m_editMode == ED_PREF_PREFIX) endEdit(false);
     requestRedraw();
 }
+
 void App::openAbout() { m_about = true; m_aboutScroll = 0; m_aboutScrollTarget = 0; requestRedraw(); }
 void App::closeAbout() { m_about = false; requestRedraw(); }
+
 static std::wstring HtmlEsc(const std::wstring& s) {
     std::wstring o; o.reserve(s.size() + 8);
     for (wchar_t c : s) {
@@ -758,6 +855,7 @@ static std::wstring HtmlEsc(const std::wstring& s) {
     }
     return o;
 }
+
 void App::openHistory() {
     auto items = load_history();
     std::wstring h;
@@ -809,6 +907,57 @@ void App::openHistory() {
         MessageBoxW(m_hwnd, L"\u65e0\u6cd5\u5199\u5165\u5386\u53f2\u9875\u9762\uff08history.html\uff09\u3002", L"ToDoWell", MB_OK | MB_ICONWARNING);
     }
 }
+
+// ============================================================
+// 新增：专注森林弹窗（模态 MessageBox 风格，用原生对话框）
+// ============================================================
+void App::openForest() {
+    // 如果正在计时，弹出进度对话框；否则弹出开始对话框
+    if (m_forestRunning) {
+        int m = (int)(m_forestRemainSecs / 60);
+        int s = (int)(m_forestRemainSecs) % 60;
+        wchar_t buf[128];
+        swprintf_s(buf, L"\u5c1a\u5269 %02d:%02d\n\n\u662f\u5426\u4e2d\u9014\u653e\u5f03\uff1f\uff08\u653e\u5f03\u4e0d\u8bb0\u5f55\uff09", m, s);
+        int ret = MessageBoxW(m_hwnd, buf, L"\u4e13\u6ce8\u68ee\u6797", MB_YESNO | MB_ICONQUESTION);
+        if (ret == IDYES) {
+            // 放弃：记录枯萎
+            ForestRecord rec;
+            rec.timestamp = now_iso();
+            rec.status = L"withered";
+            rec.task = L"\u4e2d\u9014\u653e\u5f03";
+            rec.minutes = m_cfg.focus_minutes;
+            auto recs = load_forest();
+            recs.push_back(rec);
+            save_forest(recs);
+            m_forestRunning = false;
+            m_forestRemainSecs = (float)(m_cfg.focus_minutes * 60);
+            m_forestTotalSecs = m_forestRemainSecs;
+            m_forestElapsedSecs = 0.0f;
+            m_forestDone = false;
+            requestRedraw();
+        }
+        return;
+    }
+
+    // 未在计时：显示开始对话框
+    wchar_t msg[256];
+    swprintf_s(msg,
+        L"\u5c06\u5f00\u59cb %d \u5206\u949f\u7684\u4e13\u6ce8\u8ba1\u65f6\u3002\n\n"
+        L"\u8ba1\u65f6\u5c55\u793a\u5728\u5e95\u90e8\u6811\u56fe\u6807\u65c1\u3002\n"
+        L"\u5b8c\u6210\u540e\u5c06\u81ea\u52a8\u8bb0\u5f55\u4e00\u68f5\u5065\u5eb7\u5927\u6811\u3002\n\n"
+        L"\u70b9\u51fb\u786e\u5b9a\u5f00\u59cb\uff0c\u5355\u51fb\u5e95\u90e8\u6811\u56fe\u6807\u53ef\u4e2d\u9014\u653e\u5f03\u3002",
+        m_cfg.focus_minutes);
+    int ret = MessageBoxW(m_hwnd, msg, L"\u4e13\u6ce8\u68ee\u6797 \U0001f332", MB_OKCANCEL | MB_ICONINFORMATION);
+    if (ret == IDOK) {
+        m_forestRunning = true;
+        m_forestRemainSecs = (float)(m_cfg.focus_minutes * 60);
+        m_forestTotalSecs = m_forestRemainSecs;
+        m_forestElapsedSecs = 0.0f;
+        m_forestDone = false;
+        requestRedraw();
+    }
+}
+
 float App::todoRowH(const std::wstring& text, float maxW) {
     if (text.empty()) return AppC::ROW_H;
     IDWriteTextLayout* lay = nullptr;
@@ -821,6 +970,7 @@ float App::todoRowH(const std::wstring& text, float maxW) {
     }
     return h < AppC::ROW_H ? AppC::ROW_H : h;
 }
+
 float App::rowHForTodo(int pi, int ti, float maxW) {
     float h = todoRowH(m_projects[pi].todos[ti].text, maxW);
     if (m_editMode == ED_EDIT_TODO && m_editPi == pi && m_editTi == ti) {
@@ -828,6 +978,7 @@ float App::rowHForTodo(int pi, int ti, float maxW) {
     }
     return h;
 }
+
 float App::todoCircleY(const std::wstring& text, float rowTop, float maxW) {
     float y = rowTop + AppC::ROW_H * 0.5f;
     IDWriteTextLayout* lay = nullptr;
@@ -846,6 +997,7 @@ float App::todoCircleY(const std::wstring& text, float rowTop, float maxW) {
     }
     return y;
 }
+
 void App::rebuildHits() {
     m_w = g_gfx.clientW();
     m_h = g_gfx.clientH();
@@ -932,6 +1084,7 @@ void App::rebuildHits() {
     (void)screenY;
     clampScroll();
 }
+
 void App::beginCardDrag(int pi, float contentY) {
     if (m_cardDropAnimating || !m_fades.empty() ||
         pi < 0 || pi >= (int)m_projects.size()) return;
@@ -957,6 +1110,7 @@ void App::beginCardDrag(int pi, float contentY) {
     SetCapture(m_hwnd);
     requestRedraw();
 }
+
 float App::drawProjectCard(Gfx& g, int pi, float yContent, bool floating) {
     auto& proj = m_projects[pi];
     float cTop = AppC::TITLE_H;
@@ -1020,14 +1174,12 @@ float App::drawProjectCard(Gfx& g, int pi, float yContent, bool floating) {
     y += ntH + 4.0f + 6.0f + AppC::CARD_GAP;
     return y;
 }
+
 D2D1_COLOR_F App::lerpColor(D2D1_COLOR_F a, D2D1_COLOR_F b, float t) const {
-    return D2D1::ColorF(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t);
+    return D2D1::ColorF(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
+                        a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t);
 }
 
-// Measure the real ink bounding box of a symbol glyph (via glyph run
-// analysis) and return the offset from the draw-rect center to the ink
-// center, in DIPs. Rotating around this point keeps the icon spinning in
-// place instead of wobbling around the rect center.
 static D2D1_POINT_2F IconInkCenterOffset(Gfx& g, FontId fid, const wchar_t* s) {
     D2D1_POINT_2F off = {0, 0};
     IDWriteTextFormat* f = g.font(fid);
@@ -1067,11 +1219,9 @@ static D2D1_POINT_2F IconInkCenterOffset(Gfx& g, FontId fid, const wchar_t* s) {
                                                   DWRITE_MEASURING_MODE_NATURAL,
                                                   0.0f, 0.0f, &ana);
         if (SUCCEEDED(hr) && ana) {
-            const DWRITE_TEXTURE_TYPE types[3] = {
+            const DWRITE_TEXTURE_TYPE types[2] = {
                 DWRITE_TEXTURE_ALIASED_1x1,
                 DWRITE_TEXTURE_CLEARTYPE_3x1 };
-            // Bounds are returned in device pixels (the texture type only
-            // affects the alpha data layout, not the coordinate space).
             const float sx[2] = {1.0f, 1.0f};
             const float sy[2] = {1.0f, 1.0f};
             for (int i = 0; i < 2; ++i) {
@@ -1081,7 +1231,6 @@ static D2D1_POINT_2F IconInkCenterOffset(Gfx& g, FontId fid, const wchar_t* s) {
                     float inkCx = (((float)bnd.left + (float)bnd.right) * 0.5f) / sx[i];
                     float inkCy = (((float)bnd.top + (float)bnd.bottom) * 0.5f) / sy[i];
                     float ascent = em * (float)fm.ascent / (float)fm.designUnitsPerEm;
-                    // Text metrics: width/height of the centered single glyph.
                     IDWriteTextLayout* lay = nullptr;
                     float textW = 0, lineH = 0;
                     if (SUCCEEDED(g.dw->CreateTextLayout(s, 1, f, 100.0f, 100.0f, &lay)) && lay) {
@@ -1091,9 +1240,6 @@ static D2D1_POINT_2F IconInkCenterOffset(Gfx& g, FontId fid, const wchar_t* s) {
                     }
                     if (lineH <= 0)
                         lineH = em * (float)(fm.ascent + fm.descent + fm.lineGap) / (float)fm.designUnitsPerEm;
-                    // For centered text the baseline sits at rectCenter + (ascent - lineH/2),
-                    // and the pen origin at rectCenter - textW/2. The analysis
-                    // ran with pixelsPerDip=1, so its pixel bounds are DIPs.
                     off.x = inkCx - textW * 0.5f;
                     off.y = inkCy + ascent - lineH * 0.5f;
                     break;
@@ -1111,7 +1257,6 @@ void App::render() {
     Gfx& g = g_gfx;
     float W = g.clientW(), H = g.clientH();
     g.rt->BeginDraw();
-    // 用不透明的页面背景清屏：Win7 上透明黑清屏会在栏边界露出黑线。
     g.rt->Clear(D2D1::ColorF(C::PAGE.r, C::PAGE.g, C::PAGE.b, 1.0f));
     g.fillRect(D2D1::RectF(0, 0, W, H), C::PAGE);
 
@@ -1159,7 +1304,6 @@ void App::render() {
         if (m_editMode == ED_NEW_TODO && m_editPi == (int)pi)
             ntH = todoRowH(m_editText + m_compositionText, textRightRow - textXRow);
         float headerH = cardHeaderH();
-        // Card white background
         float cardContentBot = y + AppC::CARD_TOP + headerH + 6.0f
                               + rowsH + ntH + 4.0f + 6.0f;
         if ((m_draggingCard || m_cardDropAnimating) && (int)pi == m_dragPi) {
@@ -1193,7 +1337,6 @@ void App::render() {
         float nameRight = contentLeft + contentW - AppC::CARD_INNER - delW;
         if (m_editMode == ED_EDIT_PROJECT && m_editPi == (int)pi) {
             std::wstring dtext = m_editText + m_compositionText;
-            // Full-width underline, matching the todo row editing style.
             g.drawLine(nameX, screenHy + headerH - 1, nameRight, screenHy + headerH - 1, C::ACCENT, 1.5f);
             g.drawText(dtext, D2D1::RectF(nameX, screenHy, nameRight, screenHy + headerH), F_PROJ_NAME, C::TEXT);
             drawEditCaret(g, F_PROJ_NAME, dtext, nameX, screenHy, nameRight - nameX, headerH);
@@ -1206,7 +1349,6 @@ void App::render() {
         D2D1_POINT_2F delOff = IconInkCenterOffset(g, F_SYM_TITLE, L"\u2715");
         D2D1_POINT_2F delC = { delRc.left + (delRc.right - delRc.left) * 0.5f + delOff.x,
                                delRc.top + (delRc.bottom - delRc.top) * 0.5f + delOff.y };
-        // Only the hovered delete button spins; other cards' buttons stay still.
         float delSpin = (m_hoverProjDel == (int)pi) ? m_projDelSpin : 0.0f;
         g.rt->SetTransform(D2D1::Matrix3x2F::Rotation(delSpin * 360.0f, delC));
         g.drawText(L"\u2715", delRc, F_SYM_TITLE, delCol,
@@ -1245,8 +1387,6 @@ void App::render() {
                 g.drawText(proj.todos[ti].text, D2D1::RectF(textXRow, sy, textRightRow, sy + rh), F_TODO, C::TEXT,
                            DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             } else {
-                // Editing state: full-width accent underline, matching the
-                // project title and new-task rows so the edit affordance is clear.
                 g.drawLine(textXRow, sy + rh - 2, textRightRow, sy + rh - 2, C::ACCENT, 1.5f);
                 std::wstring dtext = m_editText + m_compositionText;
                 g.drawText(dtext, D2D1::RectF(textXRow, sy, textRightRow, sy + rh), F_TODO, C::TEXT,
@@ -1269,8 +1409,8 @@ void App::render() {
             }
         }
         y += ntH + 4.0f + 6.0f + AppC::CARD_GAP;
-
     }
+
     if ((m_draggingCard || m_cardDropAnimating) && m_dragPi >= 0 && m_dragPi < (int)m_cardRects.size()) {
         D2D1_RECT_F slot = m_cardRects[m_dragPi];
         float slotTopContent = m_cardDropAnimating ? m_dropEndY : slot.top;
@@ -1282,6 +1422,7 @@ void App::render() {
         drawProjectCard(g, m_dragPi, m_dragCurrentContentY, true);
     }
     m_contentH = std::max(m_contentH, y + AppC::CARD_GAP);
+
     if (m_addingProject) {
         float hy = y + AppC::CARD_TOP;
         float screenTop = cTop + y - scrollOff;
@@ -1295,8 +1436,6 @@ void App::render() {
             float ex = contentLeft + AppC::CARD_INNER + 8.0f;
             float ew = contentW - AppC::CARD_INNER * 2 - 8.0f;
             std::wstring dtext = m_editText + m_compositionText;
-            // Keep the input text vertically centered in the card, exactly
-            // where the "新项目名称" placeholder is drawn.
             g.drawLine(ex, screenTop + 30, ex + ew, screenTop + 30, C::ACCENT, 1.5f);
             g.drawText(dtext, D2D1::RectF(ex, screenTop, ex + ew, screenBot), F_PROJ_NAME, C::TEXT);
             drawEditCaret(g, F_PROJ_NAME, dtext, ex, screenTop, ew, 30.0f);
@@ -1306,8 +1445,8 @@ void App::render() {
 
     // bottom bar
     g.fillRect(D2D1::RectF(0, H - AppC::BOT_H, W, H), C::PAGE);
-    // Rotate each icon around its own ink center (measured via glyph run
-    // analysis), not the button rect center.
+
+    // + 按钮
     D2D1_COLOR_F addCol = lerpColor(C::TEXT, C::ACCENT, m_addT);
     D2D1_RECT_F addRc = D2D1::RectF(8, H - AppC::BOT_H, 44, H);
     D2D1_POINT_2F addOff = IconInkCenterOffset(g, F_SYM_BOTTOM, L"+");
@@ -1317,6 +1456,50 @@ void App::render() {
     g.drawText(L"+", addRc, F_SYM_BOTTOM, addCol,
                DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     g.rt->SetTransform(D2D1::Matrix3x2F::Identity());
+
+    // =====================================================
+    // 新增：专注森林按钮（底部中央），显示树图标和计时
+    // =====================================================
+    {
+        float forestBtnW = 60.0f;
+        float forestBtnX = (W - forestBtnW) / 2.0f;
+        D2D1_RECT_F forestRc = D2D1::RectF(forestBtnX, H - AppC::BOT_H, forestBtnX + forestBtnW, H);
+
+        if (m_forestRunning) {
+            // 显示倒计时
+            int rm = (int)(m_forestRemainSecs / 60);
+            int rs = (int)(m_forestRemainSecs) % 60;
+            wchar_t tbuf[12];
+            swprintf_s(tbuf, L"%02d:%02d", rm, rs);
+
+            // 根据进度选树图标
+            float ratio = 1.0f - (m_forestTotalSecs > 0 ? m_forestRemainSecs / m_forestTotalSecs : 0.0f);
+            const wchar_t* treeIcon = ratio < 0.25f ? L"\U0001f330"  // 种子
+                                    : ratio < 0.60f ? L"\U0001f331"  // 幼苗
+                                    : ratio < 0.90f ? L"\U0001f33f"  // 草
+                                                    : L"\U0001f332"; // 树
+            // 上方画小树图标
+            D2D1_RECT_F iconRc = D2D1::RectF(forestBtnX, H - AppC::BOT_H, forestBtnX + forestBtnW, H - AppC::BOT_H * 0.45f);
+            g.drawText(treeIcon, iconRc, F_HINT, C::ACCENT,
+                       DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            // 下方画时间
+            D2D1_RECT_F timeRc = D2D1::RectF(forestBtnX, H - AppC::BOT_H * 0.45f, forestBtnX + forestBtnW, H);
+            g.drawText(tbuf, timeRc, F_HINT, C::ACCENT,
+                       DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+            // 进度条（底部一条细线）
+            float barW = forestBtnW * (1.0f - ratio);
+            g.fillRect(D2D1::RectF(forestBtnX, H - 3.0f, forestBtnX + barW, H),
+                       D2D1::ColorF(C::ACCENT.r, C::ACCENT.g, C::ACCENT.b, 0.7f));
+        } else {
+            // 未计时：显示绿色树图标
+            D2D1_COLOR_F forestCol = lerpColor(C::MUTED, C::ACCENT, m_forestBtnT);
+            g.drawText(L"\U0001f332", forestRc, F_SYM_BOTTOM, forestCol,
+                       DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+    }
+
+    // 齿轮按钮
     D2D1_COLOR_F gearCol = lerpColor(C::TEXT, C::ACCENT, m_gearT);
     D2D1_RECT_F gearRc = D2D1::RectF(W - 44, H - AppC::BOT_H, W - 8, H);
     D2D1_POINT_2F gearOff = IconInkCenterOffset(g, F_SYM_BOTTOM, L"\u2699");
@@ -1326,6 +1509,7 @@ void App::render() {
     g.drawText(L"\u2699", gearRc, F_SYM_BOTTOM, gearCol,
                DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     g.rt->SetTransform(D2D1::Matrix3x2F::Identity());
+
     // overlays
     if (m_overlayAlpha > 0.01f || m_settings || m_about) {
         float oa = m_overlayAlpha;
@@ -1427,11 +1611,33 @@ void App::render() {
                        DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         }
         float hy = py + 18 + 2 * posH + posGap + 6.0f;
-        g.drawText(L"\u5386\u53f2\u4ee3\u529e\u4efb\u52a1", D2D1::RectF(dlgX + 16, hy, dlgX + dlgW - 16, hy + 18), F_HINT, aboutCol);
-        float aboutY = hy + 22.0f;
+        // =====================================================
+        // 新增：设置面板中"专注时长"调节项
+        // =====================================================
+        g.drawText(L"\u4e13\u6ce8\u65f6\u957f\uff1a",
+                   D2D1::RectF(dlgX + 16, hy, dlgX + dlgW - 16, hy + 16),
+                   F_HINT, D2D1::ColorF(C::DIALOG_MM.r, C::DIALOG_MM.g, C::DIALOG_MM.b, oa));
+        const int focusMins[] = {15, 25, 30, 45};
+        float fmW = 42.0f, fmH = 22.0f, fmGap = 6.0f;
+        float fmY = hy + 18.0f;
+        for (int i = 0; i < 4; ++i) {
+            float ox = dlgX + 16 + i * (fmW + fmGap);
+            bool sel = (m_cfg.focus_minutes == focusMins[i]);
+            if (sel) g.fillRoundedRect(D2D1::RectF(ox, fmY, ox + fmW, fmY + fmH), 4.0f,
+                                       D2D1::ColorF(C::ACCENT.r, C::ACCENT.g, C::ACCENT.b, oa));
+            else g.strokeRoundedRect(D2D1::RectF(ox, fmY, ox + fmW, fmY + fmH), 4.0f,
+                                     D2D1::ColorF(C::INPUT_BD.r, C::INPUT_BD.g, C::INPUT_BD.b, oa), 1.0f);
+            D2D1_COLOR_F ftx = sel ? D2D1::ColorF(1, 1, 1, oa)
+                                   : D2D1::ColorF(C::DIALOG_TX.r, C::DIALOG_TX.g, C::DIALOG_TX.b, oa);
+            std::wstring fmLabel = std::to_wstring(focusMins[i]) + L"\u5206";
+            g.drawText(fmLabel, D2D1::RectF(ox, fmY, ox + fmW, fmY + fmH), F_HINT, ftx,
+                       DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        float hy2 = fmY + fmH + 8.0f;
+        g.drawText(L"\u5386\u53f2\u4ee3\u529e\u4efb\u52a1", D2D1::RectF(dlgX + 16, hy2, dlgX + dlgW - 16, hy2 + 18), F_HINT, aboutCol);
+        float aboutY = hy2 + 22.0f;
         g.drawText(L"\u5173\u4e8e ToDoWell", D2D1::RectF(dlgX + 16, aboutY, dlgX + dlgW - 16, aboutY + 18), F_HINT, aboutCol);
-        // Win7 输入法提示：内部版（5014）/ 公开版按版权署名自动区分
-        const bool internalBuild = std::wstring(kCopyright).find(L"5014") != std::wstring::npos;
+            const bool internalBuild = std::wstring(kCopyright).find(L"5014") != std::wstring::npos;
         const wchar_t* win7Note = internalBuild
             ? L"\u6ce8\u610f\uff1a\u5982\u679c\u5728Win7\u7cfb\u7edf\u8f93\u5165\u6587\u5b57\u65f6\u65e0\u6cd5\u663e\u793a\u6587\u672c\u5019\u9009\u6846\uff0c\u8bf7\u8054\u7cfb5014\u83b7\u53d6\u6700\u65b0\u7248\u641c\u72d7\u8f93\u5165\u6cd5\u5b89\u88c5\u5305\uff0c\u5b89\u88c5\u540e\u5373\u53ef\u89e3\u51b3\uff08\u65e0\u9700\u7ba1\u7406\u5458\u6743\u9650\uff09\u3002"
             : L"\u6ce8\u610f\uff1a\u5982\u679c\u5728Win7\u7cfb\u7edf\u8f93\u5165\u6587\u5b57\u65f6\u65e0\u6cd5\u663e\u793a\u6587\u672c\u5019\u9009\u6846\uff0c\u8bf7\u5b89\u88c5\u6700\u65b0\u7248\u641c\u72d7\u8f93\u5165\u6cd5\u5b89\u88c5\u5305\uff0c\u5b89\u88c5\u540e\u5373\u53ef\u89e3\u51b3\u3002Win10/11\u65e0\u6b64\u95ee\u9898\u3002";
@@ -1455,10 +1661,9 @@ void App::render() {
         g.drawText(kCopyright, D2D1::RectF(dlgX + 16, dlgY + dlgH - 20, dlgX + dlgW - 16, dlgY + dlgH - 6), F_FOOTER, D2D1::ColorF(C::DIALOG_FT.r, C::DIALOG_FT.g, C::DIALOG_FT.b, oa));
         if (m_editMode == ED_PREF_PREFIX) m_editRectDip = D2D1::RectF(dlgX + 16, fy, dlgX + dlgW - 16, fy + 26);
         float posBottom = noteY + noteH;
-        // Content height must be independent of the current scroll offset;
-        // posBottom already moves with sy, so subtract it back out.
         m_setContentH = (posBottom + 10.0f - sy) - dlgY + 10.0f;
     }
+
     if (m_about && m_aboutAlpha > 0.01f) {
         float dlgW = 220.0f, dlgH = 230.0f;
         float dlgX = (W - dlgW) / 2.0f, dlgY = (H - dlgH) / 2.0f;
@@ -1474,11 +1679,13 @@ void App::render() {
         const wchar_t* feats[] = {
             L"\u2022 项目分类管理：新建、双击改名、一键删除，8 色编号徽标",
             L"\u2022 待办任务：点击圆圈完成（淡出动画）、单击编辑、回车连续新增",
+            L"\u2022 快捷输入：支持 ! 重要、明天、18:00、每天等自然语言解析",
+            L"\u2022 专注森林：番茄钟计时，完成后记录健康大树",
             L"\u2022 中文输入法：拼音组合与候选框跟随光标，Win7 / Win11 均正常",
             L"\u2022 自绘 UI 与动画：Direct2D 硬件加速，归位动画、关闭淡出、悬停旋转",
-            L"\u2022 设置面板：开机自启、标题前缀、卡片文字大小、动画一键切换",
+            L"\u2022 设置面板：开机自启、标题前缀、卡片文字大小、专注时长、动画一键切换",
             L"\u2022 数据持久化：todos.json / config.json 即时写入，删除即可重置",
-            L"\u2022 轻量单文件：约 400 KB 单 exe，免安装、免联网、无第三方依赖",
+            L"\u2022 轻量单文件：约 420 KB 单 exe，免安装、免联网、无第三方依赖",
             L"\u2022 平台兼容：Windows 7 SP1+ / Windows 11，支持高 DPI",
             L"\u2022 开源免费：源码托管于 GitHub",
         };
@@ -1497,7 +1704,7 @@ void App::render() {
         g.drawText(kCopyright, D2D1::RectF(dlgX + 16, dlgY + dlgH - 20, dlgX + dlgW - 16, dlgY + dlgH - 6), F_FOOTER, D2D1::ColorF(C::DIALOG_FT.r, C::DIALOG_FT.g, C::DIALOG_FT.b, oa));
     }
 
-    // App-rendered IME candidate list (the system IME window is hidden).
+    // IME 候选框
     if (m_editMode != ED_NONE && !m_cands.empty()) {
         FontId fid = F_TODO;
         if (m_editMode == ED_EDIT_PROJECT || m_editMode == ED_ADD_PROJECT) fid = F_PROJ_NAME;
@@ -1538,10 +1745,8 @@ void App::render() {
 
     if (g.rt->EndDraw() == D2DERR_RECREATE_TARGET) { g_gfx.recreate(m_hwnd); }
 }
+
 void App::tick(float dt) {
-    // One-time fix shortly after launch: Explorer may build the desktop icon
-    // layer after this window exists (typical with auto-start), which on Win10
-    // can leave the tool window behind the icons. Re-raise once it has settled.
     if (!m_startupRaised) {
         m_startupT += dt;
         if (m_startupT >= 2.0f) {
@@ -1549,6 +1754,40 @@ void App::tick(float dt) {
             if (!m_closing) bringToFront();
         }
     }
+
+    // =====================================================
+    // 新增：专注森林计时器逻辑
+    // =====================================================
+    if (m_forestRunning && !m_forestDone) {
+        m_forestRemainSecs -= dt;
+        m_forestElapsedSecs += dt;
+        if (m_forestRemainSecs <= 0.0f) {
+            m_forestRemainSecs = 0.0f;
+            m_forestDone = true;
+            // 记录成功
+            ForestRecord rec;
+            rec.timestamp = now_iso();
+            rec.status = L"healthy";
+            rec.task = L"\u4e13\u6ce8\u5b8c\u6210";
+            rec.minutes = m_cfg.focus_minutes;
+            auto recs = load_forest();
+            recs.push_back(rec);
+            save_forest(recs);
+            // 弹窗提示
+            MessageBoxW(m_hwnd,
+                L"\u4e13\u6ce8\u5b8c\u6210\uff01\n\n"
+                L"\u8def\u6f2b\u6f2b\u5176\u4fee\u8fdc\u516e\uff0c\u4f11\u606f\u4e00\u4e0b\u5427\uff01",
+                L"\u4e13\u6ce8\u68ee\u6797 \U0001f332",
+                MB_OK | MB_ICONINFORMATION);
+            // 重置状态
+            m_forestRunning = false;
+            m_forestRemainSecs = (float)(m_cfg.focus_minutes * 60);
+            m_forestTotalSecs = m_forestRemainSecs;
+            m_forestElapsedSecs = 0.0f;
+            m_forestDone = false;
+        }
+    }
+
     if (m_cardDropAnimating) {
         m_dropAnim += dt / 0.25f;
         float t = std::min(1.0f, m_dropAnim);
@@ -1595,16 +1834,12 @@ void App::tick(float dt) {
         }
         m_cursorBlink += dt;
         if (m_edit) {
-            // Rebuild layout when the edited text changes so rows wrap live
-            // while typing (not only after committing with Enter).
             std::wstring curLayout = m_editText + m_compositionText;
             if (curLayout != m_lastEditLayout) {
                 m_lastEditLayout = curLayout;
                 rebuildHits();
                 requestRedraw();
             }
-            // Sync committed text from EDIT (skip during IME composition to avoid
-            // overwriting the D2D-rendered pinyin with the EDIT's bare text).
             if (m_compositionText.empty()) {
                 std::wstring cur = editGetText();
                 if (cur != m_editText) {
@@ -1623,7 +1858,6 @@ void App::tick(float dt) {
                     }
                 }
             }
-            // Reposition EDIT at cursor (once per frame, no text overwrite).
             positionEdit();
         }
         requestRedraw();
@@ -1649,7 +1883,7 @@ void App::tick(float dt) {
     approach(m_closeT, m_hoverClose ? 1.0f : 0.0f, dt, 18.0f);
     approach(m_addT, m_hoverAdd ? 1.0f : 0.0f, dt, 18.0f);
     approach(m_gearT, m_hoverGear ? 1.0f : 0.0f, dt, 18.0f);
-    // Icon spin: one full turn on hover, spins back when the mouse leaves.
+    approach(m_forestBtnT, m_hoverForestBtn ? 1.0f : 0.0f, dt, 18.0f);
     if (m_hoverAdd && m_addSpin < 1.0f) m_addSpin = std::min(1.0f, m_addSpin + dt / 0.35f);
     else if (!m_hoverAdd && m_addSpin > 0.0f) m_addSpin = std::max(0.0f, m_addSpin - dt / 0.30f);
     if (m_hoverGear && m_gearSpin < 1.0f) m_gearSpin = std::min(1.0f, m_gearSpin + dt / 0.35f);
@@ -1669,7 +1903,6 @@ void App::tick(float dt) {
             if (it->pi >= 0 && it->pi < (int)m_projects.size()) {
                 auto& ts = m_projects[it->pi].todos;
                 if (it->ti >= 0 && it->ti < (int)ts.size()) {
-                    // Record into the completed-task history before removing.
                     HistoryItem hi;
                     hi.project = m_projects[it->pi].name;
                     hi.text = ts[it->ti].text;
@@ -1831,15 +2064,13 @@ LRESULT App::onNcHitTest(POINT screenPt) {
     }
     return HTCLIENT;
 }
+
 void App::onMoving(RECT* r) {
     int w = r->right - r->left, h = r->bottom - r->top;
     RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     int dr = std::abs(r->right - wa.right), dl = std::abs(r->left - wa.left);
     int db = std::abs(r->bottom - wa.bottom), dt = std::abs(r->top - wa.top);
-    // Direction-aware snap: only snap edges we're moving TOWARD
-    // Use larger threshold on first drag from corner to avoid sticking
     float gap = AppC::SNAP_GAP;
-    // Don't snap if window starts at the edge and user pulls away
     if (dr < gap && m_snapRightArmed)  { r->left = wa.right - w; r->right = wa.right; m_snapRightArmed = false; }
     if (dr > gap + 5.0f) { m_snapRightArmed = true; }
     if (dl < gap && m_snapLeftArmed)   { r->right = wa.left + w; r->left = wa.left; m_snapLeftArmed = false; }
@@ -1849,21 +2080,25 @@ void App::onMoving(RECT* r) {
     if (dt < gap && m_snapTopArmed)    { r->bottom = wa.top + h; r->top = wa.top; m_snapTopArmed = false; }
     if (dt > gap + 5.0f) { m_snapTopArmed = true; }
 }
+
 void App::onSizing(RECT* r) {
     int w = r->right - r->left, h = r->bottom - r->top;
     if (w < toPx(AppC::MIN_W)) r->right = r->left + toPx(AppC::MIN_W);
     if (h < toPx(AppC::MIN_H)) r->bottom = r->top + toPx(AppC::MIN_H);
 }
+
 void App::onMinMax(MINMAXINFO* mm) {
     mm->ptMinTrackSize.x = toPx(AppC::MIN_W);
     mm->ptMinTrackSize.y = toPx(AppC::MIN_H);
 }
+
 void App::onSize() {
     g_gfx.resize();
     m_w = g_gfx.clientW(); m_h = g_gfx.clientH();
     rebuildHits();
     clampScroll();
 }
+
 void App::onWheel(int delta) {
     if (m_about) {
         m_aboutScrollTarget -= (delta / 120.0f) * AppC::SCROLL_STEP;
@@ -1879,6 +2114,7 @@ void App::onWheel(int delta) {
     clampScroll();
     requestRedraw();
 }
+
 void App::onChar(wchar_t ch) {
     if (m_editMode == ED_NONE) return;
     if (ch == L'\r' || ch == L'\n' || ch == 27) return;
@@ -1887,6 +2123,7 @@ void App::onChar(wchar_t ch) {
     m_cursorBlink = 0;
     requestRedraw();
 }
+
 void App::onKeyDown(int vk) {
     if (m_editMode == ED_NONE) return;
     if (vk == VK_RETURN) { commitEdit(); return; }
@@ -1895,24 +2132,24 @@ void App::onKeyDown(int vk) {
         cancelEdit();
         return;
     }
-    // Backspace/delete handled by EDIT control
 }
+
 void App::onCompositionUpdate(const std::wstring& s) {
     if (m_editMode == ED_NONE) return;
     m_compositionText = s;
     m_cursorBlink = 0;
     requestRedraw();
 }
+
 void App::onCompositionResult(const std::wstring& s) {
     if (m_editMode == ED_NONE) return;
     (void)s;
-    // The EDIT control updates its own text natively (TSF/IME writes straight
-    // into the control), so the app only clears its composition copy.
     m_compositionText.clear();
     m_cursorBlink = 0;
     positionEdit();
     requestRedraw();
 }
+
 void App::onCompositionEnd() {
     if (m_editMode == ED_NONE) return;
     m_compositionText.clear();
@@ -1921,9 +2158,11 @@ void App::onCompositionEnd() {
     positionEdit();
     requestRedraw();
 }
+
 static bool inRect(float x, float y, const D2D1_RECT_F& r) {
     return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
 }
+
 void App::onMouseMove(float x, float y) {
     bool moved = (std::abs(x - m_lastMouseX) > 0.5f || std::abs(y - m_lastMouseY) > 0.5f);
     m_lastMouseX = x; m_lastMouseY = y;
@@ -1952,9 +2191,17 @@ void App::onMouseMove(float x, float y) {
     m_hoverSnap = hsnap; m_hoverClose = hclose;
     int hadd = (y > H - AppC::BOT_H && x >= 8 && x <= 44) ? 1 : 0;
     int hgear = (y > H - AppC::BOT_H && x >= W - 44 && x <= W - 8) ? 1 : 0;
+    // =====================================================
+    // 新增：专注森林按钮悬停检测
+    // =====================================================
+    float forestBtnW = 60.0f;
+    float forestBtnX = (W - forestBtnW) / 2.0f;
+    int hforest = (y > H - AppC::BOT_H && x >= forestBtnX && x <= forestBtnX + forestBtnW) ? 1 : 0;
     if (hadd != m_hoverAdd) m_addT = 0;
     if (hgear != m_hoverGear) m_gearT = 0;
-    m_hoverAdd = hadd; m_hoverGear = hgear;
+    if (hforest != m_hoverForestBtn) m_forestBtnT = 0;
+    m_hoverAdd = hadd; m_hoverGear = hgear; m_hoverForestBtn = hforest;
+    
     rebuildHits();
     int hpd = -1; float contentY = y - AppC::TITLE_H + m_scroll;
     if (y < AppC::TITLE_H) {
@@ -1981,14 +2228,14 @@ void App::onMouseMove(float x, float y) {
             }
         }
     }
-    // Clear the circle highlight when the mouse moves off it.
     if (!overCircle && m_hovCircPi >= 0 && !m_suppressCircleHover) {
         m_hovCircPi = -1; m_hovCircTi = -2; m_circT = 0;
     }
     if (hpd < 0) { if (m_hoverProjDel >= 0) m_projDelT = 0; m_hoverProjDel = -1; }
     if (m_suppressCircleHover) { if (m_hovCircPi >= 0) m_circT = 0; m_hovCircPi = -1; m_hovCircTi = -2; }
-    requestRedraw(); // hover states change -> repaint so highlights appear
+    requestRedraw();
 }
+
 void App::onLButtonUp(float, float) {
     if (!m_draggingCard) return;
     ReleaseCapture();
@@ -2012,7 +2259,6 @@ void App::onLButtonUp(float, float) {
         requestRedraw();
         return;
     }
-    // Invalid state: clear everything.
     m_draggingCard = false;
     m_dragPi = -1;
     m_dragTarget = -1;
@@ -2023,6 +2269,7 @@ void App::onLButtonUp(float, float) {
     rebuildHits();
     requestRedraw();
 }
+
 void App::onLButtonDblClk(float x, float y) {
     if (m_closing) return;
     float W = m_w, H = m_h;
@@ -2049,6 +2296,7 @@ void App::onLButtonDblClk(float x, float y) {
         }
     }
 }
+
 void App::onLButtonDown(float x, float y) {
     if (m_closing) return;
     if (m_editMode == ED_PREF_PREFIX) {
@@ -2136,11 +2384,29 @@ void App::onLButtonDown(float x, float y) {
             }
         }
         float hy = py + 18 + 2 * posH + posGap + 6;
-        if (inRect(x, y, D2D1::RectF(dlgX + 16, hy, dlgX + dlgW - 16, hy + 18))) {
+        // =====================================================
+        // 新增：专注时长按钮点击
+        // =====================================================
+        const int focusMins[] = {15, 25, 30, 45};
+        float fmW = 42.0f, fmH = 22.0f, fmGap = 6.0f;
+        float fmY = hy + 18.0f;
+        for (int i = 0; i < 4; ++i) {
+            float ox = dlgX + 16 + i * (fmW + fmGap);
+            if (inRect(x, y, D2D1::RectF(ox, fmY, ox + fmW, fmY + fmH))) {
+                m_cfg.focus_minutes = focusMins[i];
+                m_forestTotalSecs = (float)(m_cfg.focus_minutes * 60);
+                m_forestRemainSecs = m_forestTotalSecs;
+                saveAll();
+                requestRedraw();
+                return;
+            }
+        }
+        float hy2 = fmY + fmH + 8.0f;
+        if (inRect(x, y, D2D1::RectF(dlgX + 16, hy2, dlgX + dlgW - 16, hy2 + 18))) {
             openHistory();
             return;
         }
-        float aboutY = hy + 22;
+        float aboutY = hy2 + 22;
         if (inRect(x, y, D2D1::RectF(dlgX + 16, aboutY, dlgX + dlgW - 16, aboutY + 18))) {
             openAbout();
             return;
@@ -2158,10 +2424,10 @@ void App::onLButtonDown(float x, float y) {
             int pw = toPx(W), ph = toPx(H);
             int tx = wa.right - pw, ty = wa.bottom - ph;
             switch (m_cfg.default_pos) {
-                case 1: tx = wa.left; ty = wa.top; break;          // 左上角
-                case 2: tx = wa.left; ty = wa.bottom - ph; break;  // 左下角
-                case 3: tx = wa.right - pw; ty = wa.top; break;    // 右上角
-                default: break;                                     // 右下角
+                case 1: tx = wa.left; ty = wa.top; break;
+                case 2: tx = wa.left; ty = wa.bottom - ph; break;
+                case 3: tx = wa.right - pw; ty = wa.top; break;
+                default: break;
             }
             RECT cur; GetWindowRect(m_hwnd, &cur);
             m_snapFromX = cur.left; m_snapFromY = cur.top;
@@ -2175,6 +2441,15 @@ void App::onLButtonDown(float x, float y) {
             startEdit(ED_ADD_PROJECT, -1, -1, L"");
             m_addingProject = true;
             m_scrollTarget = 1e9f; clampScroll();
+            return;
+        }
+        // =====================================================
+        // 新增：专注森林按钮点击
+        // =====================================================
+        float forestBtnW = 60.0f;
+        float forestBtnX = (W - forestBtnW) / 2.0f;
+        if (inRect(x, y, D2D1::RectF(forestBtnX, H - AppC::BOT_H, forestBtnX + forestBtnW, H))) {
+            openForest();
             return;
         }
         if (inRect(x, y, D2D1::RectF(W - 44, H - AppC::BOT_H, W - 8, H))) {
