@@ -11,13 +11,13 @@
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "imm32.lib")
+#pragma comment(lib, "shell32.lib")
 
-static const wchar_t* kClass = L"ToDoWellBallClass";
+static const wchar_t* kClass = L"EggDoneTodoClass";
 static UINT_PTR kTimer = 1;
 static const UINT kTrayMsg = WM_APP + 1;
 static const UINT kTrayId = 1;
-static const UINT kMenuShow = 1001;
-static const UINT kMenuExit = 1002;
 static MMRESULT g_mmTimer = 0;
 static HWND g_timerHwnd = nullptr;
 
@@ -29,7 +29,7 @@ static void AddTrayIcon(HWND hwnd) {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = kTrayMsg;
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));
-    wcscpy_s(nid.szTip, L"EggDone 待办");
+    wcscpy_s(nid.szTip, L"EggDone - 桌面待办");
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
@@ -60,12 +60,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app = new App();
             g_app->create(hwnd);
             AddTrayIcon(hwnd);
-
             QueryPerformanceFrequency(&g_qpfFreq);
             QueryPerformanceCounter(&g_qpfLast);
             timeBeginPeriod(1);
             g_timerHwnd = hwnd;
             g_mmTimer = timeSetEvent(1, 0, mmTimerCb, 0, TIME_PERIODIC);
+            SetTimer(hwnd, 2, 30000, nullptr); // 30秒提醒一次定时检查
             return 0;
         }
         case WM_PAINT: {
@@ -76,10 +76,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_ERASEBKGND: return 1;
         case WM_TIMER: {
+            if (wp == 2) {
+                if (g_app) g_app->checkReminders();
+                return 0;
+            }
             double now = nowSec();
             float dt = (float)(now - ((double)g_qpfLast.QuadPart / (double)g_qpfFreq.QuadPart));
             g_qpfLast.QuadPart = (LONGLONG)(now * (double)g_qpfFreq.QuadPart);
-            if (dt > 0.05f) dt = 0.05f;
+            if (dt > 0.1f) dt = 0.1f;
             if (g_app) g_app->tick(dt);
             return 0;
         }
@@ -89,10 +93,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_MOUSEMOVE: {
             if (g_app) g_app->onMouseMove(g_app->toDip(GET_X_LPARAM(lp)), g_app->toDip(GET_Y_LPARAM(lp)));
-            return 0;
-        }
-        case WM_MOUSELEAVE: {
-            if (g_app) g_app->onMouseLeave();
             return 0;
         }
         case WM_LBUTTONDOWN: {
@@ -115,28 +115,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_app) g_app->onKeyDown((int)wp);
             return 0;
         }
-        case WM_NCHITTEST: {
-            if (g_app) {
-                POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-                return g_app->onNcHitTest(pt);
-            }
-            break;
-        }
         case kTrayMsg: {
             if (LOWORD(lp) == WM_RBUTTONUP) {
                 SetForegroundWindow(hwnd);
                 HMENU menu = CreatePopupMenu();
-                AppendMenuW(menu, MF_STRING, kMenuShow, L"🖥️ 显示主面板");
-                AppendMenuW(menu, MF_STRING, kMenuExit, L"✖ 彻底退出");
+                AppendMenuW(menu, MF_STRING, 1001, L"🖥️ 显示主面板");
+                AppendMenuW(menu, MF_STRING, 1002, L"⚡ 开机自启切换");
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, 1003, L"✖ 彻底退出");
                 POINT pt; GetCursorPos(&pt);
-                UINT cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, nullptr);
+                int cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, nullptr);
                 DestroyMenu(menu);
-                if (cmd == kMenuShow && g_app) g_app->showFromTray(false);
-                else if (cmd == kMenuExit && g_app) g_app->exitFromTray();
-                return 0;
+                if (cmd == 1001 && g_app) g_app->expandWindow();
+                else if (cmd == 1002) set_auto_start(!is_auto_start());
+                else if (cmd == 1003) DestroyWindow(hwnd);
             } else if (LOWORD(lp) == WM_LBUTTONUP) {
-                if (g_app) g_app->showFromTray(false);
-                return 0;
+                if (g_app) g_app->expandWindow();
             }
             return 0;
         }
@@ -156,8 +150,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     SetProcessDPIAware();
 
-    // 进程单例检测
-    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"EggDone_Cpp_Single_Instance_Mutex");
+    // 互斥单例保护
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"EggDone_Win32_Instance_Mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         MessageBoxW(nullptr, L"程序已在运行！请查看屏幕右侧或系统托盘。", L"提示", MB_OK | MB_ICONINFORMATION);
         return 0;
@@ -180,19 +174,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_gfx.dpiScale = (dpi <= 0 ? 96 : dpi) / 96.0f;
 
     RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    int initPx = (int)(60.0f * g_gfx.dpiScale + 0.5f);
-    int posX = wa.right - initPx - (int)(20.0f * g_gfx.dpiScale);
-    int posY = wa.top + (int)(60.0f * g_gfx.dpiScale);
+    int initialSize = (int)(AppC::BALL_SIZE * g_gfx.dpiScale + 0.5f);
+    int initX = wa.right - initialSize - 20;
+    int initY = wa.top + 60;
 
-    // 悬浮顶层异型窗口：POPUP + TOPMOST + TOOLWINDOW（无任务栏图标、无系统标题栏）
+    // 创建顶层浮动透明窗口：无边框 + 工具栏隐藏 + 置顶
     HWND hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        kClass, L"ToDoWell",
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+        kClass, L"EggDone",
         WS_POPUP | WS_VISIBLE,
-        posX, posY, initPx, initPx,
+        initX, initY, initialSize, initialSize,
         nullptr, nullptr, hInst, nullptr);
 
     if (!hwnd) return 0;
+
+    // 设置初始不透明度
+    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
@@ -203,8 +200,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         DispatchMessageW(&msg);
     }
 
-    if (hMutex) {
-        CloseHandle(hMutex);
-    }
+    ReleaseMutex(hMutex);
+    CloseHandle(hMutex);
     return (int)msg.wParam;
 }
